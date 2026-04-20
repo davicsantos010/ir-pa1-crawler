@@ -31,6 +31,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-depth", type=int, default=None, help="Optional maximum crawl depth")
     parser.add_argument("--warc-prefix", default="corpus", help="Prefix for WARC files")
     parser.add_argument("--respect-nofollow", action="store_true", help="Respect rel=nofollow links")
+    parser.add_argument(
+        "--progress-interval-pages",
+        type=int,
+        default=100,
+        help="Print progress every N successfully crawled pages",
+    )
+    parser.add_argument(
+        "--heartbeat-seconds",
+        type=int,
+        default=60,
+        help="Save partial stats and print heartbeat every N seconds",
+    )
     return parser.parse_args()
 
 
@@ -55,10 +67,21 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     warc_dir = output_dir / "warc"
     stats_dir = output_dir / "stats"
+    logs_dir = output_dir / "logs"
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    final_stats_path = stats_dir / "crawl_stats.json"
+    partial_stats_path = stats_dir / "crawl_stats.partial.json"
 
     frontier = Frontier()
     stats = CrawlStats()
-    storage = WARCStorage(output_dir=warc_dir, prefix=args.warc_prefix, pages_per_file=1000)
+    storage = WARCStorage(
+        output_dir=warc_dir,
+        prefix=args.warc_prefix,
+        pages_per_file=1000,
+        flush_every=max(1, args.progress_interval_pages),
+    )
     robots_manager = RobotsManager(user_agent=args.user_agent, timeout=args.timeout)
 
     seeds = load_seed_urls(seeds_path)
@@ -77,6 +100,7 @@ def main() -> int:
         max_retries=args.max_retries,
         max_depth=args.max_depth,
         respect_nofollow=args.respect_nofollow,
+        progress_interval_pages=args.progress_interval_pages,
     )
 
     controller = CrawlController(
@@ -89,6 +113,8 @@ def main() -> int:
 
     workers = [Worker(worker_id=i + 1, controller=controller) for i in range(args.threads)]
 
+    last_heartbeat = time.time()
+
     try:
         for worker in workers:
             worker.start()
@@ -97,6 +123,22 @@ def main() -> int:
             if stats.pages_crawled >= args.limit:
                 controller.stop_event.set()
                 break
+
+            now = time.time()
+            if now - last_heartbeat >= args.heartbeat_seconds:
+                snapshot = stats.to_dict()
+                stats.save(partial_stats_path)
+                print(
+                    "[HEARTBEAT] "
+                    f"pages_crawled={snapshot['pages_crawled']} "
+                    f"pages_discovered={snapshot['pages_discovered']} "
+                    f"unique_domains={snapshot['unique_domains']} "
+                    f"pages_per_second={snapshot['pages_per_second']:.4f} "
+                    f"frontier_seen={frontier.seen_count()}",
+                    flush=True,
+                )
+                last_heartbeat = now
+
             time.sleep(0.5)
 
     except KeyboardInterrupt:
@@ -107,7 +149,7 @@ def main() -> int:
             worker.join()
         stats.finish()
         storage.close()
-        stats.save(stats_dir / "crawl_stats.json")
+        stats.save(final_stats_path)
 
     return 0
 

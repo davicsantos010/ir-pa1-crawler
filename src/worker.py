@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 
@@ -25,6 +24,7 @@ class CrawlConfig:
     max_retries: int
     max_depth: int | None
     respect_nofollow: bool
+    progress_interval_pages: int
 
 
 class CrawlController:
@@ -43,15 +43,64 @@ class CrawlController:
         self.config = config
         self.stop_event = threading.Event()
         self._success_lock = threading.Lock()
+        self._reserved_successes = 0
+        self._activity_lock = threading.Lock()
+        self._active_workers = 0
+        self._progress_lock = threading.Lock()
+        self._next_progress_milestone = max(1, config.progress_interval_pages)
 
     def reached_limit(self) -> bool:
-        return self.stats.pages_crawled >= self.config.limit
-
-    def register_success_if_allowed(self) -> bool:
         with self._success_lock:
-            if self.stats.pages_crawled >= self.config.limit:
+            return self._reserved_successes >= self.config.limit
+
+    def reserve_success_slot(self) -> bool:
+        with self._success_lock:
+            if self._reserved_successes >= self.config.limit:
                 return False
+            self._reserved_successes += 1
             return True
+
+    def release_success_slot(self) -> None:
+        with self._success_lock:
+            if self._reserved_successes > 0:
+                self._reserved_successes -= 1
+
+    def begin_processing(self) -> None:
+        with self._activity_lock:
+            self._active_workers += 1
+
+    def finish_processing(self) -> None:
+        with self._activity_lock:
+            if self._active_workers > 0:
+                self._active_workers -= 1
+
+    def is_idle_and_frontier_empty(self) -> bool:
+        with self._activity_lock:
+            return self._active_workers == 0 and self.frontier.size() == 0
+
+    def report_progress_if_needed(self) -> None:
+        if self.config.progress_interval_pages <= 0:
+            return
+
+        snapshot = self.stats.to_dict()
+        pages_crawled = snapshot["pages_crawled"]
+
+        with self._progress_lock:
+            if pages_crawled < self._next_progress_milestone and pages_crawled != self.config.limit:
+                return
+
+            print(
+                "[PROGRESS] "
+                f"pages_crawled={snapshot['pages_crawled']} "
+                f"pages_discovered={snapshot['pages_discovered']} "
+                f"unique_domains={snapshot['unique_domains']} "
+                f"pages_per_second={snapshot['pages_per_second']:.4f} "
+                f"frontier_seen={self.frontier.seen_count()}",
+                flush=True,
+            )
+
+            while self._next_progress_milestone <= pages_crawled:
+                self._next_progress_milestone += max(1, self.config.progress_interval_pages)
 
 
 class Worker(threading.Thread):
@@ -66,8 +115,8 @@ class Worker(threading.Thread):
         while not self.controller.stop_event.is_set():
             try:
                 item = self.controller.frontier.get(timeout=1.0)
-            except Exception:
-                if self.controller.reached_limit():
+            except queue.Empty:
+                if self.controller.reached_limit() or self.controller.is_idle_and_frontier_empty():
                     self.controller.stop_event.set()
                 continue
 
@@ -77,12 +126,16 @@ class Worker(threading.Thread):
                 if self.controller.reached_limit():
                     self.controller.stop_event.set()
                     return
+                self.controller.begin_processing()
                 self.process_item(item)
             finally:
+                self.controller.finish_processing()
                 self.controller.frontier.task_done()
 
     def process_item(self, item: FrontierItem) -> None:
         url = item.url
+        reserved_slot = False
+
         try:
             if not self.controller.robots_manager.allowed(self.session, url):
                 return
@@ -100,9 +153,10 @@ class Worker(threading.Thread):
             if "text/html" not in content_type:
                 return
 
-            if not self.controller.register_success_if_allowed():
+            if not self.controller.reserve_success_slot():
                 self.controller.stop_event.set()
                 return
+            reserved_slot = True
 
             html_text = response.text
             html_bytes = response.content
@@ -115,9 +169,9 @@ class Worker(threading.Thread):
             self.controller.stats.register_success(
                 url=url,
                 text=visible_text,
-                status_code=response.status_code,
                 response_size=len(html_bytes),
             )
+            reserved_slot = False
 
             if self.controller.config.debug:
                 debug_record = {
@@ -127,6 +181,8 @@ class Worker(threading.Thread):
                     "Timestamp": int(time.time()),
                 }
                 print(json.dumps(debug_record, ensure_ascii=False), flush=True)
+
+            self.controller.report_progress_if_needed()
 
             if self.controller.reached_limit():
                 self.controller.stop_event.set()
@@ -146,6 +202,8 @@ class Worker(threading.Thread):
                     self.controller.stats.register_discovery()
 
         except Exception as exc:
+            if reserved_slot:
+                self.controller.release_success_slot()
             self.controller.stats.register_error(type(exc).__name__)
 
     def fetch_with_retries(self, url: str) -> requests.Response | None:

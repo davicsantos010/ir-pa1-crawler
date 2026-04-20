@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import requests
-from Protego import Protego
+from protego import Protego
 
 
 @dataclass
@@ -32,6 +32,7 @@ class RobotsManager:
         robots_url = self._robots_url(url)
         crawl_delay = 0.1
         parser = Protego.parse("")
+
         try:
             response = session.get(
                 robots_url,

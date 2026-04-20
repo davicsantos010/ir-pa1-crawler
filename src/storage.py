@@ -10,10 +10,17 @@ from warcio.warcwriter import WARCWriter
 
 
 class WARCStorage:
-    def __init__(self, output_dir: Path, prefix: str = "corpus", pages_per_file: int = 1000) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        prefix: str = "corpus",
+        pages_per_file: int = 1000,
+        flush_every: int = 100,
+    ) -> None:
         self.output_dir = output_dir
         self.prefix = prefix
         self.pages_per_file = pages_per_file
+        self.flush_every = max(1, flush_every)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.Lock()
@@ -37,15 +44,15 @@ class WARCStorage:
             assert self._gzip_file is not None
 
             if self._pages_in_current_file >= self.pages_per_file:
+                self._gzip_file.flush()
                 self._gzip_file.close()
                 self._open_new_file()
 
             payload = io.BytesIO(html_bytes)
             record = self._writer.create_warc_record(
                 uri=url,
-                record_type="response",
+                record_type="resource",
                 payload=payload,
-                http_headers=None,
                 warc_headers_dict={
                     "WARC-Identified-Payload-Type": content_type,
                 },
@@ -53,9 +60,13 @@ class WARCStorage:
             self._writer.write_record(record)
             self._pages_in_current_file += 1
 
+            if self._pages_in_current_file % self.flush_every == 0:
+                self._gzip_file.flush()
+
     def close(self) -> None:
         with self._lock:
             if self._gzip_file is not None:
+                self._gzip_file.flush()
                 self._gzip_file.close()
                 self._gzip_file = None
                 self._writer = None

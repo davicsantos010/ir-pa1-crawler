@@ -26,7 +26,7 @@ class CrawlStats:
         with self._lock:
             self.pages_discovered += count
 
-    def register_success(self, url: str, text: str, status_code: int, response_size: int) -> None:
+    def register_success(self, url: str, text: str, response_size: int) -> None:
         domain = urlparse(url).netloc.lower()
         token_count = len(text.split())
         with self._lock:
@@ -34,7 +34,6 @@ class CrawlStats:
             self.domains.add(domain)
             self.pages_per_domain[domain] += 1
             self.tokens_per_page.append(token_count)
-            self.http_status_counter[str(status_code)] += 1
             self.bytes_downloaded += response_size
 
     def register_http_status(self, status_code: int) -> None:
@@ -49,17 +48,29 @@ class CrawlStats:
         self.end_time = time.time()
 
     def to_dict(self) -> dict:
-        elapsed = (self.end_time or time.time()) - self.start_time
-        tokens = self.tokens_per_page
+        with self._lock:
+            start_time = self.start_time
+            end_time = self.end_time or time.time()
+            pages_crawled = self.pages_crawled
+            pages_discovered = self.pages_discovered
+            domains = set(self.domains)
+            pages_per_domain = Counter(self.pages_per_domain)
+            tokens = list(self.tokens_per_page)
+            http_status_counter = Counter(self.http_status_counter)
+            error_counter = Counter(self.error_counter)
+            bytes_downloaded = self.bytes_downloaded
+
+        elapsed = end_time - start_time
         avg_tokens = (sum(tokens) / len(tokens)) if tokens else 0.0
-        sorted_domains = self.pages_per_domain.most_common()
+        sorted_domains = pages_per_domain.most_common()
+
         return {
-            "start_time_unix": int(self.start_time),
-            "end_time_unix": int(self.end_time or time.time()),
+            "start_time_unix": int(start_time),
+            "end_time_unix": int(end_time),
             "elapsed_seconds": elapsed,
-            "pages_crawled": self.pages_crawled,
-            "pages_discovered": self.pages_discovered,
-            "unique_domains": len(self.domains),
+            "pages_crawled": pages_crawled,
+            "pages_discovered": pages_discovered,
+            "unique_domains": len(domains),
             "pages_per_domain": dict(sorted_domains),
             "tokens_per_page": {
                 "count": len(tokens),
@@ -67,13 +78,14 @@ class CrawlStats:
                 "max": max(tokens) if tokens else 0,
                 "avg": avg_tokens,
             },
-            "http_status_counter": dict(self.http_status_counter),
-            "error_counter": dict(self.error_counter),
-            "bytes_downloaded": self.bytes_downloaded,
-            "pages_per_second": (self.pages_crawled / elapsed) if elapsed > 0 else 0.0,
+            "http_status_counter": dict(http_status_counter),
+            "error_counter": dict(error_counter),
+            "bytes_downloaded": bytes_downloaded,
+            "pages_per_second": (pages_crawled / elapsed) if elapsed > 0 else 0.0,
         }
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = self.to_dict()
         with path.open("w", encoding="utf-8") as fh:
-            json.dump(self.to_dict(), fh, ensure_ascii=False, indent=2)
+            json.dump(snapshot, fh, ensure_ascii=False, indent=2)
